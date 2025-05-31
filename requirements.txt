@@ -1,0 +1,7 @@
+conda env create --file final_environment.yaml
+
+
+transformers==4.49.0
+
+conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
+pip install numpy==1.24.1

@@ -70,12 +70,13 @@ def main(rank, args):
 
     if args.dataset == 'hicodet':
         object_to_target = train_loader.dataset.dataset.object_to_verb
+        object_to_interaction = train_loader.dataset.dataset.object_to_interaction
         args.num_verbs = 117
     elif args.dataset == 'vcoco':
         object_to_target = list(train_loader.dataset.dataset.object_to_action.values())
         args.num_verbs = 24
     
-    model = build_detector(args, object_to_target)
+    model = build_detector(args, object_to_target,object_to_interaction)
 
     if os.path.exists(args.resume):
         print(f"=> Rank {rank}: PViC loaded from saved checkpoint {args.resume}.")
@@ -157,7 +158,7 @@ if __name__ == '__main__':
         parser.add_argument('--raw-lambda', default=1.7, type=float)
 
     parser.add_argument('--kv-src', default='C5', type=str, choices=['C5', 'C4', 'C3'])
-    parser.add_argument('--repr-dim', default=384, type=int)
+    parser.add_argument('--repr-dim', default=512, type=int)
     parser.add_argument('--triplet-enc-layers', default=1, type=int)
     parser.add_argument('--triplet-dec-layers', default=2, type=int)
 
@@ -170,9 +171,9 @@ if __name__ == '__main__':
     parser.add_argument('--resume', default='', help='Resume from a model')
     parser.add_argument('--use-wandb', default=False, action='store_true')
 
-    parser.add_argument('--port', default='1234', type=str)
+    parser.add_argument('--port', default='7777', type=str)
     parser.add_argument('--seed', default=140, type=int)
-    parser.add_argument('--world-size', default=8, type=int)
+    parser.add_argument('--world-size', default=2, type=int)
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--sanity', action='store_true')

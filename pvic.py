@@ -17,11 +17,13 @@ from collections import OrderedDict
 from typing import Optional, Tuple, List
 from torchvision.ops import FeaturePyramidNetwork
 
-from transformers import (
+from local_transformers import (
     TransformerEncoder,
     TransformerDecoder,
     TransformerDecoderLayer,
     SwinTransformer,
+    CLIPTransformerDecoderLayer,
+    CLIPTransformerDecoder
 )
 
 from ops import (
@@ -37,6 +39,119 @@ from detr.models import build_model as build_base_detr
 from h_detr.models import build_model as build_advanced_detr
 from detr.models.position_encoding import PositionEmbeddingSine
 from detr.util.misc import NestedTensor, nested_tensor_from_tensor_list
+
+import clip
+import torchvision
+
+import numpy as np
+from collections import defaultdict
+import hashlib
+
+
+# CLIP에서 사용하는 정규화값
+CLIP_MEAN = [0.4815, 0.4578, 0.4082]
+CLIP_STD = [0.2686, 0.2613, 0.2758]
+
+def dynamic_tau(pair_score, q=0.85):
+    if pair_score.numel() == 0:
+        # 아무 pair도 없으니 '절대 통과 못 하는' 큰 τ 반환
+        return 1.0
+    
+    # 상위 15% 만 유지
+    return torch.quantile(pair_score, 1-q)
+
+# ImageNet 역정규화 함수
+def denormalize_imagenet(tensor):
+    """ ImageNet Normalize를 되돌리는 함수 """
+    mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(-1, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(-1, 1, 1)
+    return tensor * std + mean  # [3, H, W]
+
+def get_objects_for_interactions(interaction_indices, hoi_to_object, detected_labels):
+
+    interaction_objects = {
+        int(idx): hoi_to_object[int(idx)]
+        for idx in interaction_indices
+        if 0 <= idx < len(hoi_to_object)
+    }
+
+    # 2. detected_labels를 리스트로 변환
+    detected_labels_list = detected_labels.tolist()
+    
+    # 3. 유일한 object 리스트와 detected_labels의 교집합 구하기
+    common_objects = list(set(detected_labels_list) & set(interaction_objects.values()))
+    
+    # 4. 교집합에 해당하는 object를 가진 interaction만 필터링
+    filtered_interactions = {
+        idx: obj for idx, obj in interaction_objects.items()
+        if obj in common_objects
+    }
+
+    common_objects= sorted(common_objects)
+    if common_objects ==[]:
+        common_objects.append(0)
+    if common_objects[0]!=0:
+        common_objects.insert(0,0)
+
+    kept_indices = [
+        i for i, label in enumerate(detected_labels_list)
+        if label in common_objects
+    ]
+
+    return filtered_interactions, kept_indices
+
+def build_hoi_to_verbs(filtered: dict, interaction_to_verb: list):
+    """
+    Args
+        filtered            : dict {interaction_id: object_id}
+        interaction_to_verb : list / tuple
+                              각 interaction_id 가 취하는 verb id 혹은 그 목록
+                              예) [5, 3, 11, ...]  또는  [[5,7], [3], [11,12], ...]
+    Returns
+        obj_to_verbs : dict {object_id: sorted list[int]}
+    """
+    obj_to_verbs = defaultdict(list)
+
+    for intr_id, obj_id in filtered.items():
+        verb_ids = interaction_to_verb[intr_id]      # 한 interaction 에 대응하는 verb(들)
+
+        # verb_ids 가 정수인지, iterable 인지 구분
+        if isinstance(verb_ids, (list, tuple, set)):
+            obj_to_verbs[obj_id].extend(verb_ids)
+        else:                                        # 단일 정수
+            obj_to_verbs[obj_id].append(verb_ids)
+
+    # 중복 제거 + 정렬
+    for obj_id, vlist in obj_to_verbs.items():
+        obj_to_verbs[obj_id] = sorted(set(vlist))
+
+    return obj_to_verbs
+
+class ClipCache:
+    def __init__(self, max_items=50000):
+        self.store = {}          # key → (512,) fp16 tensor
+        self.max_items = max_items
+
+    def get(self, key):
+        return self.store.get(key, None)
+
+    def add(self, key, emb):
+        if len(self.store) >= self.max_items:
+            self.store.pop(next(iter(self.store)))   # FIFO simple eviction
+        self.store[key] = emb
+
+@torch.inference_mode()
+def make_image_key(img_tensor: torch.Tensor) -> str:
+    """
+    img_tensor : (3,H,W) float32  ‑2.1179‥2.64
+    Returns    : 40‑byte hex SHA‑1 string
+    """
+    # ① float → 0‥255 uint8  (denormalize 포함)
+    uint8 = (img_tensor * 255).clamp(0, 255).to(torch.uint8).cpu().contiguous()
+
+    # ② 바이트 스트림 해시 (≈ 3×224×224 = 150 KB → 0.1 ms)
+    sha1 = hashlib.sha1(uint8.numpy().tobytes()).hexdigest()
+    return sha1
 
 class MultiModalFusion(nn.Module):
     def __init__(self, fst_mod_size, scd_mod_size, repr_size):
@@ -61,12 +176,14 @@ class MultiModalFusion(nn.Module):
         return z
 
 class HumanObjectMatcher(nn.Module):
-    def __init__(self, repr_size, num_verbs, obj_to_verb, dropout=.1, human_idx=0):
+    def __init__(self, repr_size, num_verbs, obj_to_verb, object_to_interaction, dropout=.1, clip_model = None,
+        preprocess = None, human_idx=0):
         super().__init__()
         self.repr_size = repr_size
         self.num_verbs = num_verbs
         self.human_idx = human_idx
         self.obj_to_verb = obj_to_verb
+        self.object_to_interaction = object_to_interaction
 
         self.ref_anchor_head = nn.Sequential(
             nn.Linear(256, 256), nn.ReLU(),
@@ -79,6 +196,23 @@ class HumanObjectMatcher(nn.Module):
         )
         self.encoder = TransformerEncoder(num_layers=2, dropout=dropout)
         self.mmf = MultiModalFusion(512, repr_size, repr_size)
+
+        txt_embed = np.load('/user/template_embedding.npy')
+        self.txt_embed = torch.from_numpy(txt_embed)
+
+        hoi_to_verb = np.load('/user/hoi_to_verb.npy')
+        self.hoi_to_verb = hoi_to_verb
+
+        hoi_to_object = np.load('/user/hoi_to_object.npy')
+        self.hoi_to_object = hoi_to_object
+
+        self.clip_model = clip_model.eval()
+        for p in self.clip_model.parameters():
+            p.requires_grad=False
+        self.preprocess = preprocess
+
+        self.clip_cache = ClipCache()
+        self.patch_cache = ClipCache()
 
     def check_human_instances(self, labels):
         is_human = labels == self.human_idx
@@ -106,6 +240,70 @@ class HumanObjectMatcher(nn.Module):
 
         return box_pe, c_pe
 
+    
+    @torch.no_grad()
+    def _global_clip_prior(self, image_tensor, labels):
+
+        key = make_image_key(image_tensor)
+        img_emb = self.clip_cache.get(key)
+
+        if img_emb is None:
+            image_tensor = denormalize_imagenet(image_tensor)
+            image_pil = torchvision.transforms.ToPILImage()(image_tensor)
+            img = self.preprocess(image_pil).unsqueeze(0).to(image_tensor.device)
+
+            img_emb = self.clip_model.encode_image(img)
+            img_emb = F.normalize(img_emb, dim=-1).squeeze(0)          # (1,512)
+            self.clip_cache.add(key, img_emb)
+
+        sim = (img_emb @ self.txt_embed.to(img_emb.device).T)  # (K,)
+        # keep = sim.topk(20).indices
+
+        # filtered_keep, kept_indices = get_objects_for_interactions(keep, self.hoi_to_object, labels)
+
+        return sim
+    
+    @torch.no_grad()
+    def _patch_clip_features(self, image_tensor):
+        visual = self.clip_model.visual
+
+        key = make_image_key(image_tensor)
+        patch_features = self.patch_cache.get(key)
+
+        if patch_features is None:
+            image_tensor = denormalize_imagenet(image_tensor)
+            image_pil = torchvision.transforms.ToPILImage()(image_tensor)
+            img = self.preprocess(image_pil).unsqueeze(0).to(image_tensor.device).half()
+            x = visual.conv1(img)  
+            x = x.reshape(x.shape[0], x.shape[1], -1)  # (B, C, HW)
+            x = x.permute(0, 2, 1)                     # (B, HW, C)
+
+            cls = visual.class_embedding.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, 1, C)
+            x = torch.cat([cls, x], dim=1)             # (B, 1+HW, C)
+
+            x = x + visual.positional_embedding        # **shape OK** (broadcast)
+
+            x = visual.ln_pre(x)                       # ✔️ CLIP uses ln_pre **before** Tx
+            x = x.permute(1, 0, 2).type_as(img)      # (1+HW, B, C)  – dtype keep
+            x = visual.transformer(x)                  # Tx blocks
+            x = x.permute(1, 0, 2)                     # (B, 1+HW, C)
+
+            x = visual.ln_post(x)                      # ❗ **누락** – CLIP does ln_post after Tx
+                                                    # (identical to ln_pre for ViT-B/32)
+
+            patch_tokens = x[:, 1:, :]                 # (B, HW, C)
+            if hasattr(visual, "proj") and visual.proj is not None:
+                patch_features = patch_tokens @ visual.proj     # (B, HW, 512)
+            else:
+                patch_features = patch_tokens                  # ResNet CLIP
+
+            self.patch_cache.add(key, patch_features.cpu())
+        pos_embed_p = visual.positional_embedding[1:, :]      # (HW, clip_width)
+        patch_features = patch_features.to(image_tensor.device)
+        pos_embed_p = pos_embed_p.to(image_tensor.device)
+
+        return patch_features, pos_embed_p
+    
     def forward(self, region_props, image_sizes, device=None):
         if device is None:
             device = region_props[0]["hidden_states"].device
@@ -115,8 +313,13 @@ class HumanObjectMatcher(nn.Module):
         prior_scores = []
         object_types = []
         positional_embeds = []
+        clip_patch_features = []
+        clip_pos_list = []
         for i, rp in enumerate(region_props):
-            boxes, scores, labels, embeds = rp.values()
+            boxes, scores, labels, embeds, image_tensor = rp.values() # boxes: (개수, 4) / scores&labels: (개수) / embeds: (개수, 256)
+            clip_similarity = self._global_clip_prior(image_tensor.to(device), labels)
+            clip_patch_feat, clip_pos = self._patch_clip_features(image_tensor.to(device))
+
             nh = self.check_human_instances(labels)
             n = len(boxes)
             # Enumerate instance pairs
@@ -132,8 +335,11 @@ class HumanObjectMatcher(nn.Module):
                 prior_scores.append(torch.zeros(0, 2, self.num_verbs, device=device))
                 object_types.append(torch.zeros(0, device=device, dtype=torch.int64))
                 positional_embeds.append({})
+                clip_patch_features.append(torch.zeros(1,196, 512, device=device))
+                clip_pos_list.append(torch.zeros(1,196, 768, device=device))
                 continue
             x = x.flatten(); y = y.flatten()
+
             # Compute spatial features
             pairwise_spatial = compute_spatial_encodings(
                 [boxes[x],], [boxes[y],], [image_sizes[i],]
@@ -150,19 +356,28 @@ class HumanObjectMatcher(nn.Module):
                 pairwise_spatial_reshaped[x_keep, y_keep]
             )
             # Append matched human-object pairs
+
+            # interaction_dict = build_hoi_to_verbs(interaction_list, self.hoi_to_verb)
+
+            base_prior = compute_prior_scores( ##여기에서 obj_cls_ 이런거 써서 객체에 종속되나??????
+                x_keep, y_keep, scores, labels, self.num_verbs, self.training,
+                self.obj_to_verb, clip_similarity, self.hoi_to_verb, self.hoi_to_object
+            )
+
+            # final_prior = base_prior * verb_gate.view(-1,1,self.num_verbs)   # (M,1,V) broadcasting
             ho_queries.append(ho_q)
             paired_indices.append(torch.stack([x_keep, y_keep], dim=1))
-            prior_scores.append(compute_prior_scores(
-                x_keep, y_keep, scores, labels, self.num_verbs, self.training,
-                self.obj_to_verb
-            ))
+            prior_scores.append(base_prior)
             object_types.append(labels[y_keep])
             positional_embeds.append({
                 "centre": torch.cat([c_pe[x_keep], c_pe[y_keep]], dim=-1).unsqueeze(1),
                 "box": torch.cat([box_pe[x_keep], box_pe[y_keep]], dim=-1).unsqueeze(1)
             })
-
-        return ho_queries, paired_indices, prior_scores, object_types, positional_embeds
+            clip_patch_features.append(clip_patch_feat)
+            clip_pos_list.append(clip_pos.unsqueeze(0))
+        
+        #prior_scores: verb에 대한 prior 확률
+        return ho_queries, paired_indices, prior_scores, object_types, positional_embeds, clip_patch_features, clip_pos_list
 
 class Permute(nn.Module):
     def __init__(self, dims: List[int]):
@@ -209,7 +424,7 @@ class PViC(nn.Module):
     def __init__(self,
         detector: Tuple[nn.Module, str], postprocessor: nn.Module,
         feature_head: nn.Module, ho_matcher: nn.Module,
-        triplet_decoder: nn.Module, num_verbs: int,
+        triplet_decoder: nn.Module, clip_decoder: nn.Module, num_verbs: int,
         repr_size: int = 384, human_idx: int = 0,
         # Focal loss hyper-parameters
         alpha: float = 0.5, gamma: float = .1,
@@ -232,7 +447,9 @@ class PViC(nn.Module):
         self.feature_head = feature_head
         self.kv_pe = PositionEmbeddingSine(128, 20, normalize=True)
         self.decoder = triplet_decoder
+        self.clip_decoder = clip_decoder
         self.binary_classifier = nn.Linear(repr_size, num_verbs)
+        self.clip_classifier = nn.Linear(repr_size, num_verbs)
 
         self.repr_size = repr_size
         self.human_idx = human_idx
@@ -244,13 +461,21 @@ class PViC(nn.Module):
         self.max_instances = max_instances
         self.raw_lambda = raw_lambda
 
+        self.clip2kv = nn.Linear(768, repr_size)
+
     def freeze_detector(self):
         for p in self.detector.parameters():
             p.requires_grad = False
 
     def compute_classification_loss(self, logits, prior, labels):
-        prior = torch.cat(prior, dim=0).prod(1)
-        x, y = torch.nonzero(prior).unbind(1)
+        prior = torch.cat(prior, dim=0).prod(1)           # (P,V)
+        idx   = torch.nonzero(prior > 0, as_tuple=False)
+        if idx.numel() == 0:
+            return torch.tensor(0., device=logits.device, requires_grad=True)
+
+        x, y = idx[:,0], idx[:,1]
+        if x.max() >= logits.shape[1]:
+            raise RuntimeError(f"pair index OOB: max {x.max()} vs {logits.shape[1]-1}")  #x는 pair 인덱스. y는 verb 인덱스
 
         logits = logits[:, x, y]
         prior = prior[x, y]
@@ -448,11 +673,15 @@ class PViC(nn.Module):
             max_instances=self.max_instances
         )
         boxes = [r['boxes'] for r in region_props]
+        assert len(region_props)==len(images)
+        for il in range(len(images)):
+            region_props[il]['image']= images[il]
+
         # Produce human-object pairs.
         (
             ho_queries,
             paired_inds, prior_scores,
-            object_types, positional_embeds
+            object_types, positional_embeds, clip_patches, clip_pos
         ) = self.ho_matcher(region_props, image_sizes)
         # Compute keys/values for triplet decoder.
         memory, mask = self.feature_head(features)
@@ -460,35 +689,52 @@ class PViC(nn.Module):
         memory = memory.reshape(b, h * w, c)
         kv_p_m = mask.reshape(-1, 1, h * w)
         k_pos = self.kv_pe(NestedTensor(memory, mask)).permute(0, 2, 3, 1).reshape(b, h * w, 1, c)
+
+        clip_pos = torch.cat(clip_pos, dim = 0)
+        clip_pos_lin = self.clip2kv(clip_pos)
+
         # Enhance visual context with triplet decoder.
         query_embeds = []
-        for i, (ho_q, mem) in enumerate(zip(ho_queries, memory)):
-            query_embeds.append(self.decoder(
+        for i, (ho_q, mem, c_p) in enumerate(zip(ho_queries, memory, clip_patches)):
+            raw_decod = self.decoder(
                 ho_q.unsqueeze(1),              # (n, 1, q_dim)
                 mem.unsqueeze(1),               # (hw, 1, kv_dim)
                 kv_padding_mask=kv_p_m[i],      # (1, hw)
                 q_pos=positional_embeds[i],     # centre: (n, 1, 2*kv_dim), box: (n, 1, 4*kv_dim)
                 k_pos=k_pos[i]                  # (hw, 1, kv_dim)
-            ).squeeze(dim=2))
+            ).squeeze(dim=2)
+
+
+            clip_decod = self.clip_decoder(
+                ho_q.unsqueeze(1),              # (n, 1, q_dim)
+                c_p.permute(1,0,2).float(),
+                q_pos = positional_embeds[i],
+                k_pos = clip_pos_lin[i].unsqueeze(1)
+            ).squeeze(dim=2) # (n, 1, 512)
+
+            query_embeds.append(torch.cat([raw_decod[-1:], clip_decod[-1:]], dim=0))
+
         # Concatenate queries from all images in the same batch.
-        query_embeds = torch.cat(query_embeds, dim=1)   # (ndec, \sigma{n}, q_dim)
-        logits = self.binary_classifier(query_embeds)
+        query_embeds = torch.cat(query_embeds, dim=1)   
+        sim = self.clip_classifier(query_embeds[1:])
+        logits = self.binary_classifier(query_embeds[:1]) #logits_shape : (num_decoder_layers, total_pairs, num_verbs) (2, 쿼리합, 117)
+        total_logits = torch.cat([logits, sim], dim=0) #logits_shape : (2, 쿼리합, num_verbs)
 
         if self.training:
             labels = associate_with_ground_truth(
                 boxes, paired_inds, targets, self.num_verbs
-            )
-            cls_loss = self.compute_classification_loss(logits, prior_scores, labels)
+            ) #lables: pairs, num_verbs 형태의 0/1 이진행렬 -> verb 별 시그모이드/이진 분류
+            cls_loss = self.compute_classification_loss(total_logits, prior_scores, labels)
             loss_dict = dict(cls_loss=cls_loss)
             return loss_dict
 
         detections = self.postprocessing(
             boxes, paired_inds, object_types,
-            logits[-1], prior_scores, image_sizes
+            (total_logits[-1]+total_logits[0])/2, prior_scores, image_sizes
         )
         return detections
 
-def build_detector(args, obj_to_verb):
+def build_detector(args, obj_to_verb, object_to_interaction):
     if args.detector == "base":
         detr, _, postprocessors = build_base_detr(args)
     elif args.detector == "advanced":
@@ -501,11 +747,16 @@ def build_detector(args, obj_to_verb):
             print(f"Load weights for the object detector from {args.pretrained}")
         detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model_state_dict'])
 
+    clip_model, preprocess = clip.load("ViT-B/16", device='cuda')
+
     ho_matcher = HumanObjectMatcher(
         repr_size=args.repr_dim,
         num_verbs=args.num_verbs,
         obj_to_verb=obj_to_verb,
-        dropout=args.dropout
+        object_to_interaction=object_to_interaction,
+        dropout=args.dropout,
+        clip_model = clip_model,
+        preprocess = preprocess
     )
     decoder_layer = TransformerDecoderLayer(
         q_dim=args.repr_dim, kv_dim=args.hidden_dim,
@@ -525,11 +776,24 @@ def build_detector(args, obj_to_verb):
         args.hidden_dim, num_channels,
         return_layer, args.triplet_enc_layers
     )
+
+    clip_decoder_layer = CLIPTransformerDecoderLayer(
+        q_dim=args.repr_dim, kv_dim=args.hidden_dim,
+        ffn_interm_dim=args.repr_dim * 4,
+        num_heads=args.nheads, dropout=args.dropout
+    )
+    clip_decoder = CLIPTransformerDecoder(
+        decoder_layer=clip_decoder_layer,
+        num_layers=args.triplet_dec_layers
+    )
+
+
     model = PViC(
         (detr, args.detector), postprocessors['bbox'],
         feature_head=feature_head,
         ho_matcher=ho_matcher,
         triplet_decoder=triplet_decoder,
+        clip_decoder = clip_decoder,
         num_verbs=args.num_verbs,
         repr_size=args.repr_dim,
         alpha=args.alpha, gamma=args.gamma,

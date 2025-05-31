@@ -37,8 +37,8 @@ class TransformerEncoderLayer(nn.Module):
         self.v_proj = nn.Linear(dim, dim)
         # The positional embeddings include box centres, widths and heights,
         # which will be twice the representation size.
-        self.qpos_proj = nn.Linear(2 * dim, dim)
-        self.kpos_proj = nn.Linear(2 * dim, dim)
+        self.qpos_proj = nn.Linear(2*dim, dim) #clip에 맞출거면 dim,dim (원래는 2*dim dim)
+        self.kpos_proj = nn.Linear(2*dim, dim) #clip에 맞출거면 dim,dim (원래는 2*dim, dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_interm_dim), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(ffn_interm_dim, dim)
@@ -68,7 +68,7 @@ class TransformerEncoderLayer(nn.Module):
         return x, attn_weights
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, hidden_size=256, num_heads=8, num_layers=2, dropout=.1):
+    def __init__(self, hidden_size=256, num_heads=8, num_layers=2, dropout=.1): #clip에 맞출거면 hidden_size=512 (원래는 hidden_size=256)
         super().__init__()
         self.num_layers = num_layers
         self.layers = nn.ModuleList([TransformerEncoderLayer(
@@ -120,9 +120,9 @@ class TransformerDecoderLayer(nn.Module):
 
         self.qk_attn = MultiheadAttention(q_dim * 2, num_heads, dropout=dropout, vdim=q_dim)
         self.qk_attn_q_proj = nn.Linear(q_dim, q_dim)
-        self.qk_attn_k_proj = nn.Linear(kv_dim, q_dim)
-        self.qk_attn_v_proj = nn.Linear(kv_dim, q_dim)
-        self.qk_attn_kpos_proj = nn.Linear(kv_dim, q_dim)
+        self.qk_attn_k_proj = nn.Linear(kv_dim, q_dim) #256->512 로 맞춰 (원래는 kv_dim, q_dim)
+        self.qk_attn_v_proj = nn.Linear(kv_dim, q_dim) #256->512 로 맞춰 (원래는 kv_dim, q_dim)
+        self.qk_attn_kpos_proj = nn.Linear(kv_dim, q_dim) #256->512 로 맞춰 (원래는 kv_dim, q_dim)
         self.qk_attn_qpos_proj = nn.Linear(kv_dim * 2, q_dim)
 
         self.ffn = nn.Sequential(
@@ -264,6 +264,160 @@ class TransformerDecoder(nn.Module):
         return output
 
 
+class CLIPTransformerDecoderLayer(nn.Module):
+
+    def __init__(self, q_dim, kv_dim, num_heads, ffn_interm_dim, dropout=0.1):
+        """
+        Parameters:
+        -----------
+        q_dim: int
+            Dimension of the interaction queries.
+        kv_dim: int
+            Dimension of the image features.
+        num_heads: int
+            Number of heads used in multihead attention.
+        ffn_interm_dim: int
+            Dimension of the intermediate representation in the feedforward network.
+        dropout: float, default: 0.1
+            Dropout percentage used during training.
+        """
+        super().__init__()
+        self.q_dim = q_dim
+        self.kv_dim = kv_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.ffn_interm_dim = ffn_interm_dim
+
+        # Linear projections on qkv have been removed in this custom layer.
+        self.q_attn = MultiheadAttention(q_dim, num_heads, dropout=dropout)
+        # Add the missing linear projections.
+        self.q_attn_q_proj = nn.Linear(q_dim, q_dim)
+        self.q_attn_k_proj = nn.Linear(q_dim, q_dim)
+        self.q_attn_v_proj = nn.Linear(q_dim, q_dim)
+        # Each scalar is mapped to a vector of shape kv_dim // 2.
+        # For a box pair, the dimension is 8 * (kv_dim // 2).
+        self.q_attn_qpos_proj = nn.Linear(kv_dim * 4, q_dim)
+        self.q_attn_kpos_proj = nn.Linear(kv_dim * 4, q_dim)
+
+        self.qk_attn = MultiheadAttention(q_dim * 2, num_heads, dropout=dropout, vdim=q_dim)
+        self.qk_attn_q_proj = nn.Linear(q_dim, q_dim)
+        self.qk_attn_k_proj = nn.Linear(kv_dim*2, q_dim) #256->512 로 맞춰 (원래는 kv_dim, q_dim)
+        self.qk_attn_v_proj = nn.Linear(kv_dim*2, q_dim) #256->512 로 맞춰 (원래는 kv_dim, q_dim)
+        self.qk_attn_kpos_proj = nn.Linear(kv_dim*2, q_dim) #256->512 로 맞춰 (원래는 kv_dim, q_dim)
+        self.qk_attn_qpos_proj = nn.Linear(kv_dim * 2, q_dim)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(q_dim, ffn_interm_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_interm_dim, q_dim)
+        )
+        self.ln1 = nn.LayerNorm(q_dim)
+        self.ln2 = nn.LayerNorm(q_dim)
+        self.ln3 = nn.LayerNorm(q_dim)
+        self.dp1 = nn.Dropout(dropout)
+        self.dp2 = nn.Dropout(dropout)
+        self.dp3 = nn.Dropout(dropout)
+
+    def forward(self,
+            queries: Tensor, features: Tensor,
+            q_pos: Tensor, k_pos: Tensor,
+            q_attn_mask: Optional[Tensor] = None,
+            qk_attn_mask: Optional[Tensor] = None,
+            q_padding_mask: Optional[Tensor] = None,
+            kv_padding_mask: Optional[Tensor] = None,
+        ):
+        # Perform self attention amongst queries
+        q = self.q_attn_q_proj(queries)
+        k = self.q_attn_k_proj(queries)
+        v = self.q_attn_v_proj(queries)
+        q_p = self.q_attn_qpos_proj(q_pos["box"])
+        k_p = self.q_attn_kpos_proj(q_pos["box"])
+        q = q + q_p
+        k = k + k_p
+        q_attn = self.q_attn(
+            q, k, value=v, attn_mask=q_attn_mask,
+            key_padding_mask=q_padding_mask
+        )[0]
+        queries = self.ln1(queries + self.dp1(q_attn))
+        # Perform cross attention from memory features to queries
+        q = self.qk_attn_q_proj(queries)
+        k = self.qk_attn_k_proj(features)
+        v = self.qk_attn_v_proj(features)
+        q_p = self.qk_attn_qpos_proj(q_pos["centre"])
+        k_p = self.qk_attn_kpos_proj(k_pos)
+
+        n_q, bs, _ = q.shape
+        q = q.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
+        q_p = q_p.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
+        q = torch.cat([q, q_p], dim=3).view(n_q, bs, self.q_dim * 2)
+
+        hw, _, _ = k.shape
+        k = k.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
+        k_p = k_p.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
+        k = torch.cat([k, k_p], dim=3).view(hw, bs, self.q_dim * 2)
+
+        qk_attn = self.qk_attn(
+            query=q, key=k, value=v, attn_mask=qk_attn_mask,
+            key_padding_mask=kv_padding_mask
+        )[0]
+        queries = self.ln2(queries + self.dp2(qk_attn))
+        queries = self.ln3(queries + self.dp3(self.ffn(queries)))
+
+        return queries
+
+class CLIPTransformerDecoder(nn.Module):
+
+    def __init__(self, decoder_layer, num_layers, return_intermediate=True):
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for i in range(num_layers)])
+        self.num_layers = num_layers
+        self.norm = nn.LayerNorm(decoder_layer.q_dim)
+        self.return_intermediate = return_intermediate
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, queries, features,
+            q_attn_mask: Optional[Tensor] = None,
+            qk_attn_mask: Optional[Tensor] = None,
+            q_padding_mask: Optional[Tensor] = None,
+            kv_padding_mask: Optional[Tensor] = None,
+            q_pos: Optional[Tensor] = None,
+            k_pos: Optional[Tensor] = None,
+        ):
+        # Add support for zero layers
+        if self.num_layers == 0:
+            return queries.unsqueeze(0)
+        # Explicitly handle zero-size queries
+        if queries.numel() == 0:
+            rp = self.num_layers if self.return_intermediate else 1
+            return queries.unsqueeze(0).repeat(rp, 1, 1, 1)
+
+        output = queries
+        intermediate = []
+        for layer in self.layers:
+            output = layer(
+                output, features,
+                q_attn_mask=q_attn_mask,
+                qk_attn_mask=qk_attn_mask,
+                q_padding_mask=q_padding_mask,
+                kv_padding_mask=kv_padding_mask,
+                q_pos=q_pos, k_pos=k_pos,
+            )
+            if self.return_intermediate:
+                intermediate.append(self.norm(output))
+
+        if self.return_intermediate:
+            output = torch.stack(intermediate)
+        else:
+            output = self.norm(output).unsqueeze(0)
+        return output
+    
 def _get_relative_position_bias(
     relative_position_bias_table: torch.Tensor, relative_position_index: torch.Tensor, window_size: List[int]
 ) -> torch.Tensor:

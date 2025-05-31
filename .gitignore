@@ -131,3 +131,17 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+outputs/
+visualize_analyzing_edit/
+visualize_analyzing_pvic/
+visualize_analyzing_step1/
+
+*.npy
+
+pvic_step1_asl.py
+pvic_step1_interhead_duplicate.py
+zip_new_cls_head.py
+zip_temp.py
+

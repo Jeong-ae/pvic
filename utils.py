@@ -32,6 +32,9 @@ from pocket.utils import DetectionAPMeter, BoxPairAssociation
 
 from ops import recover_boxes
 from detr.datasets import transforms as T
+from pathlib import Path
+import json
+
 
 def custom_collate(batch):
     images = []
@@ -285,6 +288,9 @@ class CustomisedDLE(DistributedLearningEngine):
             dataset.object_n_verb_to_interaction, dtype=float
         ))
 
+        pairs_per_img, tp_per_img, fp_per_img = [], [], []
+        scores_all, preds_all, labels_all = [], [], []   # for npz dump (rank‑0 only)
+
         if self._rank == 0:
             meter = DetectionAPMeter(
                 600, nproc=1, algorithm='11P',
@@ -324,6 +330,13 @@ class CustomisedDLE(DistributedLearningEngine):
                             scores[det_idx].view(-1)
                         )
 
+                # diagnostics per image
+                n_pair = int(scores.numel())
+                n_tp = int(labels.sum())
+                pairs_per_img.append(n_pair)
+                tp_per_img.append(n_tp)
+                fp_per_img.append(n_pair - n_tp)
+
                 scores_clt.append(scores)
                 preds_clt.append(interactions)
                 labels_clt.append(labels)
@@ -337,10 +350,48 @@ class CustomisedDLE(DistributedLearningEngine):
             labels_ddp = pocket.utils.all_gather(labels_clt)
 
             if self._rank == 0:
-                meter.append(torch.cat(scores_ddp), torch.cat(preds_ddp), torch.cat(labels_ddp))
+                s_batch = torch.cat(scores_ddp)
+                p_batch = torch.cat(preds_ddp)
+                l_batch = torch.cat(labels_ddp)
+                meter.append(s_batch, p_batch, l_batch)
+
+                scores_all.append(s_batch.numpy())
+                preds_all.append(p_batch.numpy())
+                labels_all.append(l_batch.numpy())
+
 
         if self._rank == 0:
             ap = meter.eval()
+            # ap_vec = ap["AP"]
+            summary = {
+                "mAP": float(ap.mean()),
+                "avg_pairs_per_img": float(np.mean(pairs_per_img)),
+                "avg_TP_per_img": float(np.mean(tp_per_img)),
+                "avg_FP_per_img": float(np.mean(fp_per_img)),
+            }
+            # print to console
+            print("\n=== EVAL SUMMARY (rank‑0) ===")
+            for k, v in summary.items():
+                print(f"{k}: {v}")
+            print("============================\n")
+
+            # file dump
+            # dump_dir = '/user/visualize_analyzing_edit'
+            # if dump_dir is not None:
+            #     dump_dir = Path(dump_dir)
+            #     dump_dir.mkdir(parents=True, exist_ok=True)
+
+            #     # 1. summary json (+ per‑class AP)
+            #     with open(dump_dir / f"PVIC_summary.json", "w") as f:
+            #         json.dump({**summary, "AP": ap.tolist()}, f, indent=2)
+
+            #     # 2. raw inference tensors (compressed NPZ)
+            #     np.savez_compressed(
+            #         dump_dir / f"PVIC_infer.npz",
+            #         scores=np.concatenate(scores_all, axis=0),
+            #         preds=np.concatenate(preds_all, axis=0),
+            #         labels=np.concatenate(labels_all, axis=0),
+            #     )
             return ap
         else:
             return -1
@@ -416,15 +467,22 @@ class CustomisedDLE(DistributedLearningEngine):
             for j in range(nimages):
                 if all_results[i, j] is None:
                     all_results[i, j] = np.zeros((0, 0))
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
-        # Cache results
+        out_root = Path('/user/visualize_analyzing_edit')
+        out_root.mkdir(parents=True, exist_ok=True)
+
         for object_idx in range(80):
             interaction_idx = object2int[object_idx]
-            sio.savemat(
-                os.path.join(cache_dir, f'detections_{(object_idx + 1):02d}.mat'),
-                dict(all_boxes=all_results[interaction_idx])
-            )
+            filename = out_root / f"detections_{object_idx + 1:02d}.json"
+            with open(filename, "w") as f:
+                json.dump(
+                    [[item.tolist() if isinstance(item, np.ndarray) else item
+                    for item in row]
+                    for row in all_results[interaction_idx]],
+                    f
+                )
+        
+
+        print(f"[cache_hico_debug_json] saved to {out_root}")
 
     @torch.no_grad()
     def test_vcoco(self):

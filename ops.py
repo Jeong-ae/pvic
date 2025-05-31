@@ -12,7 +12,7 @@ import torch
 import torchvision.ops.boxes as box_ops
 
 from torch import Tensor
-from typing import List, Tuple
+from typing import Optional, List, Tuple
 
 def compute_sinusoidal_pe(pos_tensor: Tensor, temperature: float = 10000.) -> Tensor:
     """
@@ -49,9 +49,9 @@ def prepare_region_proposals(
 ):
     region_props = []
     for res, hs, sz in zip(results, hidden_states, image_sizes):
-        sc, lb, bx = res.values()
+        sc, lb, bx = res.values() ##sc: 예측된 객체의 confidence score / lb: 예측된 객체의 class label / bx: 예측된 객체의 bounding box (x1,y1,x2,y2)
 
-        keep = box_ops.batched_nms(bx, sc, lb, 0.5)
+        keep = box_ops.batched_nms(bx, sc, lb, 0.5) #겹치는 박스 제거 (동일 클래서 IoU 0.5이상이면 낮은 score박스 제거)
         sc = sc[keep].view(-1)
         lb = lb[keep].view(-1)
         bx = bx[keep].view(-1, 4)
@@ -64,7 +64,7 @@ def prepare_region_proposals(
 
         keep = torch.nonzero(sc >= box_score_thresh).squeeze(1)
 
-        is_human = lb == human_idx
+        is_human = lb == human_idx #label이 human_idx (0)인것만 사람으로 분류 / 나머지 객체로 간주
         hum = torch.nonzero(is_human).squeeze(1)
         obj = torch.nonzero(is_human == 0).squeeze(1)
         n_human = is_human[keep].sum(); n_object = len(keep) - n_human
@@ -92,10 +92,10 @@ def prepare_region_proposals(
         keep = torch.cat([keep_h, keep_o])
 
         region_props.append(dict(
-            boxes=bx[keep],
-            scores=sc[keep],
-            labels=lb[keep],
-            hidden_states=hs[keep]
+            boxes=bx[keep], #선택된 객체들의 위치
+            scores=sc[keep], #confidence score
+            labels=lb[keep], #class label
+            hidden_states=hs[keep] #transformer에서 추출된 해당박스에 대응되는 feature vector(256 차원)
         ))
 
     return region_props
@@ -151,17 +151,91 @@ def pad_queries(queries):
         q_padding_mask[i, n:] = True
     return padded_queries, q_padding_mask
 
+def make_pair_verb_mask(
+        prior_i,
+    pair_obj_labels: torch.Tensor,      # (N,)
+    obj_to_verbs: dict,                 # object_id -> list[int]
+    num_verbs: int = 117,
+    device=None
+):
+    """
+    Returns
+        mask : (N, num_verbs)  float32, 가능한 verb 위치 1
+    """
+    if device is None:
+        device = pair_obj_labels.device
+    N = pair_obj_labels.size(0)
+
+    # ② object 단위로 가능한 verb 위치를 1.0 으로 덮어쓰기
+    for obj_id in pair_obj_labels.unique().tolist():
+        verb_ids = obj_to_verbs.get(obj_id, [])
+        if not verb_ids:
+            continue
+        rows = (pair_obj_labels == obj_id).nonzero(as_tuple=False).flatten()   # (k,)
+        cols = torch.tensor(verb_ids, device=device)                           # (m,)
+        prior_i[rows.unsqueeze(1), cols] = 1.0                                 # overwrite
+
+    return prior_i    
+
 def compute_prior_scores(
     x: Tensor, y: Tensor,
     scores: Tensor, labels: Tensor,
     num_classes: int, is_training: bool,
-    obj_cls_to_tgt_cls: list
+    obj_cls_to_tgt_cls: list, 
+    sim_interaction: Tensor,
+    hoi_to_verb: list, hoi_to_object: list,
+    alpha: float = 0.5, 
 ) -> Tensor:
-    prior_h = torch.zeros(len(x), num_classes, device=scores.device)
+    device = scores.device
+    P = len(x)
+    # ------------------------------------------------------------------
+    # 1) object×verb CLIP 가중치 행렬 W[obj, verb] 생성
+    # ------------------------------------------------------------------
+    
+    #####initialize mask#####
+    M = torch.zeros(80, num_classes)
+    initialize_reranking = [obj_cls_to_tgt_cls[obj.item()]
+        for obj in labels[y].unique()]
+    unique_objects_id = labels[y].unique()
+    row_idx = torch.tensor([
+                r for r, c_list in zip(unique_objects_id, initialize_reranking) for _ in c_list])
+    col_idx = torch.tensor([c for c_list in initialize_reranking for c in c_list])
+    M[row_idx, col_idx] = 0.1
+
+    ####sim value #####
+    obj_id = hoi_to_object[sim_interaction.topk(20).indices.detach().cpu()]
+    verb_id = hoi_to_verb[sim_interaction.topk(20).indices.detach().cpu()]
+    use_sim =sim_interaction.topk(20).values.float().detach().cpu()
+    sim_z = (use_sim - use_sim.mean()) / (use_sim.std(unbiased=False) + 1e-6)
+    sim_prop = sim_z.sigmoid()
+    M[obj_id, verb_id] = sim_prop  
+    M = M.to(device) 
+
+    
+    # W = torch.zeros(max(hoi_to_object) + 1, num_classes, device=device)
+
+    # for intr_id, sim in enumerate(sim_interaction):     # 600회 루프
+    #     o_id = hoi_to_object[intr_id]
+    #     v_ids = hoi_to_verb[intr_id]
+    #     if not isinstance(v_ids, (list, tuple)):
+    #         v_ids = [v_ids]
+    #     for v in v_ids:
+    #         W[o_id, v] = torch.maximum(W[o_id, v], sim)
+
+    #     # 2) object-별로 가능한 verb 부분만 정규화 (0~1)
+    # for o_id, v_list in enumerate(obj_cls_to_tgt_cls):
+    #     if not v_list:                     # 어떤 object는 verb set이 비어 있을 수 있음
+    #         continue
+    #     w_slice = W[o_id, v_list]
+    #     if w_slice.max() > 0:
+    #         # min-max → 0~1 스케일
+    #         W[o_id, v_list] = (w_slice - w_slice.min()) / (w_slice.max() - w_slice.min() + 1e-6)
+
+    # 1) detector 기반 prior 초기화
+    prior_h = torch.zeros(P, num_classes, device=device)
     prior_o = torch.zeros_like(prior_h)
 
-    s_h = scores[x]
-    s_o = scores[y]
+    s_h, s_o = scores[x], scores[y]
 
     # Map object class index to target class index
     # Object class index to target class index is a one-to-many mapping
@@ -175,7 +249,18 @@ def compute_prior_scores(
     prior_h[pair_idx, flat_target_idx] = s_h[pair_idx]
     prior_o[pair_idx, flat_target_idx] = s_o[pair_idx]
 
+    # ------------------------------------------------------------------
+    # 4) object-verb CLIP weight 적용 → prior_o 갱신
+    # ------------------------------------------------------------------
+    obj_ids_pair = labels[y]                 # (P,)
+    clip_weight  = M[obj_ids_pair]           # (P, 117)  object별 verb weight
+
+    # prior_o = s_o * ( α + (1-α)·clip_weight )
+    prior_h *= alpha + (1.0 - alpha) * clip_weight
+    prior_o *= alpha + (1.0 - alpha) * clip_weight
+
     return torch.stack([prior_h, prior_o], dim=1)
+
 
 def compute_spatial_encodings(
     boxes_1: List[Tensor], boxes_2: List[Tensor],
